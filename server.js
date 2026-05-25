@@ -73,17 +73,28 @@ async function getDirectStreamUrl(videoUrl) {
 
   // YouTube 2024'ten beri 'web' client'ı bot olarak işaretliyor.
   // Cookies + farklı client kombinasyonları deneniyor.
+  //
+  // FORMAT: Sabit format kodu kullanmıyoruz çünkü YouTube format'ları
+  // sık değişiyor. Bunun yerine fallback chain kullanıyoruz:
+  //   1. mp4 360p video+audio (en uyumlu)
+  //   2. mp4 480p video+audio
+  //   3. herhangi mp4 (en düşük çözünürlüklü)
+  //   4. herhangi format (worst quality)
+  // ffmpeg JPEG yakalama için 360p bile yeterli, fazla bandwidth yemek
+  // istemiyoruz.
+  const FORMAT_CHAIN = 'best[height<=480][ext=mp4]/best[height<=480]/best[ext=mp4]/worst[ext=mp4]/worst';
+
   const clientStrategies = [
     // 1. Cookies + web client (en başarılı kombinasyon)
-    { extractorArgs: 'youtube:player_client=web', format: '18', useCookies: true },
+    { extractorArgs: 'youtube:player_client=web', useCookies: true },
     // 2. Cookies + tv_embedded
-    { extractorArgs: 'youtube:player_client=tv_embedded', format: '18', useCookies: true },
+    { extractorArgs: 'youtube:player_client=tv_embedded', useCookies: true },
     // 3. Cookies + android
-    { extractorArgs: 'youtube:player_client=android', format: '18', useCookies: true },
+    { extractorArgs: 'youtube:player_client=android', useCookies: true },
     // 4. Cookies'siz fallback'ler
-    { extractorArgs: 'youtube:player_client=tv_embedded,web_safari', format: '18', useCookies: false },
-    { extractorArgs: 'youtube:player_client=ios', format: '18', useCookies: false },
-    { extractorArgs: 'youtube:player_client=mediaconnect', format: 'best[height<=480][ext=mp4]/best[ext=mp4]', useCookies: false },
+    { extractorArgs: 'youtube:player_client=tv_embedded,web_safari', useCookies: false },
+    { extractorArgs: 'youtube:player_client=ios', useCookies: false },
+    { extractorArgs: 'youtube:player_client=mediaconnect', useCookies: false },
   ];
 
   let lastError = null;
@@ -95,7 +106,7 @@ async function getDirectStreamUrl(videoUrl) {
       console.log(`[yt-dlp] Deneniyor: ${strategy.extractorArgs}${strategy.useCookies ? ' (+cookies)' : ''}`);
       const opts = {
         dumpSingleJson: true,
-        format: strategy.format,
+        format: FORMAT_CHAIN,
         noWarnings: true,
         noCheckCertificates: true,
         preferFreeFormats: true,
@@ -108,11 +119,22 @@ async function getDirectStreamUrl(videoUrl) {
 
       const info = await youtubedl(videoUrl, opts);
 
-      const url = info.url || info.requested_formats?.[0]?.url || info.formats?.find(f => f.url)?.url;
+      // info.url ya da formats array'inden en iyi URL'i çek
+      let url = info.url;
+      if (!url && Array.isArray(info.requested_formats) && info.requested_formats.length) {
+        url = info.requested_formats[0].url;
+      }
+      if (!url && Array.isArray(info.formats) && info.formats.length) {
+        // Sadece video+audio combined olanları tercih et
+        const combined = info.formats.find(f => f.url && f.acodec !== 'none' && f.vcodec !== 'none');
+        const anyUrl = info.formats.find(f => f.url);
+        url = (combined || anyUrl)?.url;
+      }
       if (!url) {
         throw new Error('Stream URL alınamadı (info objesi geldi ama url yok)');
       }
-      console.log(`[yt-dlp] ✅ ${strategy.extractorArgs}${strategy.useCookies ? ' (+cookies)' : ''} ile başarılı`);
+      const fmtNote = info.format || info.format_id || '?';
+      console.log(`[yt-dlp] ✅ ${strategy.extractorArgs}${strategy.useCookies ? ' (+cookies)' : ''} başarılı (format: ${fmtNote})`);
       videoInfoCache.set(videoUrl, { url, expiresAt: Date.now() + VIDEO_INFO_TTL_MS });
       return url;
     } catch (e) {
