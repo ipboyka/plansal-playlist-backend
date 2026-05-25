@@ -65,45 +65,56 @@ try {
   console.error('[Cookies] Yazma hatası:', e.message);
 }
 
+// ─── PROXY — env var'dan oku ─────────────────────────────────
+// YT_PROXY: http://username:password@ip:port  (residential proxy önerilir)
+// Datacenter IP'leri (Render dahil) YouTube tarafından bot olarak işaretlenir,
+// residential proxy bu sorunu çözer.
+const proxyUrl = process.env.YT_PROXY || null;
+if (proxyUrl) {
+  // Şifreyi log'da gösterme
+  const safeUrl = proxyUrl.replace(/:\/\/[^@]+@/, '://***:***@');
+  console.log('[Proxy] YT_PROXY mevcut:', safeUrl);
+} else {
+  console.warn('[Proxy] YT_PROXY env var YOK. YouTube IP-based bot detection riski var.');
+}
+
 async function getDirectStreamUrl(videoUrl) {
   const cached = videoInfoCache.get(videoUrl);
   if (cached && cached.expiresAt > Date.now()) {
     return cached.url;
   }
 
-  // YouTube 2024'ten beri 'web' client'ı bot olarak işaretliyor.
-  // Cookies + farklı client kombinasyonları deneniyor.
-  //
-  // FORMAT: Sabit format kodu kullanmıyoruz çünkü YouTube format'ları
-  // sık değişiyor. Bunun yerine fallback chain kullanıyoruz:
-  //   1. mp4 360p video+audio (en uyumlu)
-  //   2. mp4 480p video+audio
-  //   3. herhangi mp4 (en düşük çözünürlüklü)
-  //   4. herhangi format (worst quality)
-  // ffmpeg JPEG yakalama için 360p bile yeterli, fazla bandwidth yemek
-  // istemiyoruz.
+  // Format: esnek chain — sabit kod kullanmıyoruz çünkü YouTube format'ları değişiyor
   const FORMAT_CHAIN = 'best[height<=480][ext=mp4]/best[height<=480]/best[ext=mp4]/worst[ext=mp4]/worst';
 
+  // Strategy chain: client + cookies + proxy kombinasyonları
   const clientStrategies = [
-    // 1. Cookies + web client (en başarılı kombinasyon)
-    { extractorArgs: 'youtube:player_client=web', useCookies: true },
-    // 2. Cookies + tv_embedded
-    { extractorArgs: 'youtube:player_client=tv_embedded', useCookies: true },
-    // 3. Cookies + android
-    { extractorArgs: 'youtube:player_client=android', useCookies: true },
-    // 4. Cookies'siz fallback'ler
-    { extractorArgs: 'youtube:player_client=tv_embedded,web_safari', useCookies: false },
-    { extractorArgs: 'youtube:player_client=ios', useCookies: false },
-    { extractorArgs: 'youtube:player_client=mediaconnect', useCookies: false },
+    // 1. Proxy + cookies + web client (residential IP → en doğal)
+    { extractorArgs: 'youtube:player_client=web', useCookies: true, useProxy: true },
+    // 2. Proxy + cookies + tv_embedded
+    { extractorArgs: 'youtube:player_client=tv_embedded', useCookies: true, useProxy: true },
+    // 3. Proxy + cookies + android
+    { extractorArgs: 'youtube:player_client=android', useCookies: true, useProxy: true },
+    // 4. Proxy + cookies + ios
+    { extractorArgs: 'youtube:player_client=ios', useCookies: true, useProxy: true },
+    // 5. Proxy yok ama cookies var (eski strateji)
+    { extractorArgs: 'youtube:player_client=web', useCookies: true, useProxy: false },
+    { extractorArgs: 'youtube:player_client=tv_embedded', useCookies: true, useProxy: false },
+    // 6. Hiçbir şey yok (sadece son çare)
+    { extractorArgs: 'youtube:player_client=tv_embedded,web_safari', useCookies: false, useProxy: false },
+    { extractorArgs: 'youtube:player_client=mediaconnect', useCookies: false, useProxy: false },
   ];
 
   let lastError = null;
   for (const strategy of clientStrategies) {
-    // Cookies istenen ama mevcut değilse bu stratejiyi atla
+    // Cookies/Proxy istenen ama mevcut değilse bu stratejiyi atla
     if (strategy.useCookies && !cookiesAvailable) continue;
+    if (strategy.useProxy && !proxyUrl) continue;
+
+    const label = `${strategy.extractorArgs}${strategy.useCookies ? ' +cookies' : ''}${strategy.useProxy ? ' +proxy' : ''}`;
 
     try {
-      console.log(`[yt-dlp] Deneniyor: ${strategy.extractorArgs}${strategy.useCookies ? ' (+cookies)' : ''}`);
+      console.log(`[yt-dlp] Deneniyor: ${label}`);
       const opts = {
         dumpSingleJson: true,
         format: FORMAT_CHAIN,
@@ -116,16 +127,17 @@ async function getDirectStreamUrl(videoUrl) {
       if (strategy.useCookies && cookiesAvailable) {
         opts.cookies = COOKIES_PATH;
       }
+      if (strategy.useProxy && proxyUrl) {
+        opts.proxy = proxyUrl;
+      }
 
       const info = await youtubedl(videoUrl, opts);
 
-      // info.url ya da formats array'inden en iyi URL'i çek
       let url = info.url;
       if (!url && Array.isArray(info.requested_formats) && info.requested_formats.length) {
         url = info.requested_formats[0].url;
       }
       if (!url && Array.isArray(info.formats) && info.formats.length) {
-        // Sadece video+audio combined olanları tercih et
         const combined = info.formats.find(f => f.url && f.acodec !== 'none' && f.vcodec !== 'none');
         const anyUrl = info.formats.find(f => f.url);
         url = (combined || anyUrl)?.url;
@@ -134,20 +146,24 @@ async function getDirectStreamUrl(videoUrl) {
         throw new Error('Stream URL alınamadı (info objesi geldi ama url yok)');
       }
       const fmtNote = info.format || info.format_id || '?';
-      console.log(`[yt-dlp] ✅ ${strategy.extractorArgs}${strategy.useCookies ? ' (+cookies)' : ''} başarılı (format: ${fmtNote})`);
+      console.log(`[yt-dlp] ✅ ${label} başarılı (format: ${fmtNote})`);
       videoInfoCache.set(videoUrl, { url, expiresAt: Date.now() + VIDEO_INFO_TTL_MS });
       return url;
     } catch (e) {
       lastError = e;
       const msg = (e.message || '').substring(0, 300);
-      console.warn(`[yt-dlp] ${strategy.extractorArgs}${strategy.useCookies ? ' (+cookies)' : ''} başarısız: ${msg.substring(0, 150)}`);
+      console.warn(`[yt-dlp] ${label} başarısız: ${msg.substring(0, 200)}`);
       continue;
     }
   }
 
   // Hepsi başarısız
   const errSummary = (lastError?.message || 'unknown').substring(0, 400);
-  throw new Error('Tüm yt-dlp client\'ları başarısız. Cookies durumu: ' + (cookiesAvailable ? 'mevcut' : 'YOK (Render env var YT_COOKIES ekle)') + '. Son hata: ' + errSummary);
+  const config = [
+    cookiesAvailable ? 'cookies:✓' : 'cookies:YOK',
+    proxyUrl ? 'proxy:✓' : 'proxy:YOK',
+  ].join(', ');
+  throw new Error(`Tüm yt-dlp client'ları başarısız (${config}). Son hata: ${errSummary}`);
 }
 
 // ─── HEALTH ENDPOINT ─────────────────────────────────────────────
@@ -157,6 +173,7 @@ app.get('/health', (req, res) => {
     ok: true,
     firebase: firebaseReady,
     cookies: cookiesAvailable,
+    proxy: !!proxyUrl,
     cacheSize: videoInfoCache.size,
     uptime: process.uptime(),
     memoryMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
