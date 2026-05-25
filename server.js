@@ -52,17 +52,52 @@ async function getDirectStreamUrl(videoUrl) {
   if (cached && cached.expiresAt > Date.now()) {
     return cached.url;
   }
-  const info = await youtubedl(videoUrl, {
-    dumpSingleJson: true,
-    format: '18', // 360p mp4 — frame yakalamak için bol bol yeter
-    noWarnings: true,
-    noCheckCertificates: true,
-    preferFreeFormats: true,
-    youtubeSkipDashManifest: true,
-  });
-  const url = info.url;
-  videoInfoCache.set(videoUrl, { url, expiresAt: Date.now() + VIDEO_INFO_TTL_MS });
-  return url;
+
+  // YouTube 2024'ten beri 'web' client'ı bot olarak işaretliyor.
+  // tv_embedded ve android client'ları engellemeyi atlatıyor.
+  // Birden fazla client dene, biri çalışırsa onu kullan.
+  const clientStrategies = [
+    { extractorArgs: 'youtube:player_client=tv_embedded,web_safari', format: '18' },
+    { extractorArgs: 'youtube:player_client=android', format: '18' },
+    { extractorArgs: 'youtube:player_client=ios', format: '18' },
+    { extractorArgs: 'youtube:player_client=tv_embedded', format: 'best[height<=480][ext=mp4]/best[ext=mp4]' },
+    { extractorArgs: 'youtube:player_client=mediaconnect', format: '18' },
+  ];
+
+  let lastError = null;
+  for (const strategy of clientStrategies) {
+    try {
+      console.log(`[yt-dlp] Deneniyor: ${strategy.extractorArgs}`);
+      const info = await youtubedl(videoUrl, {
+        dumpSingleJson: true,
+        format: strategy.format,
+        noWarnings: true,
+        noCheckCertificates: true,
+        preferFreeFormats: true,
+        youtubeSkipDashManifest: true,
+        extractorArgs: strategy.extractorArgs,
+        // YouTube botluk tespitini zorlaştır
+        userAgent: 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36',
+      });
+
+      const url = info.url || info.requested_formats?.[0]?.url || info.formats?.find(f => f.url)?.url;
+      if (!url) {
+        throw new Error('Stream URL alınamadı (info objesi geldi ama url yok)');
+      }
+      console.log(`[yt-dlp] ✅ ${strategy.extractorArgs} ile başarılı`);
+      videoInfoCache.set(videoUrl, { url, expiresAt: Date.now() + VIDEO_INFO_TTL_MS });
+      return url;
+    } catch (e) {
+      lastError = e;
+      const msg = (e.message || '').substring(0, 200);
+      console.warn(`[yt-dlp] ${strategy.extractorArgs} başarısız: ${msg}`);
+      // "Sign in to confirm" tipik bot detection — diğer client'a geç
+      continue;
+    }
+  }
+
+  // Hepsi başarısız
+  throw new Error('Tüm yt-dlp client\'ları başarısız: ' + (lastError?.message || 'unknown'));
 }
 
 // ─── HEALTH ENDPOINT ─────────────────────────────────────────────
@@ -228,8 +263,11 @@ app.post('/api/frames', async (req, res) => {
     try {
       streamUrl = await getDirectStreamUrl(videoUrl);
     } catch (e) {
-      // Stream alınamazsa hepsine error dön
-      for (const m of missList) results.push({ time: m.time, error: 'stream-fetch-failed' });
+      // Stream alınamazsa hepsine error dön (gerçek hata mesajıyla)
+      console.error('[Batch] Stream URL alınamadı:', e.message);
+      const errMsg = (e.message || 'stream-fetch-failed').substring(0, 300);
+      for (const m of missList) results.push({ time: m.time, error: errMsg });
+      results.sort((a, b) => a.time - b.time);
       return res.json({ results });
     }
 
