@@ -47,6 +47,24 @@ try {
 const videoInfoCache = new Map(); // videoUrl → { url, expiresAt }
 const VIDEO_INFO_TTL_MS = 60 * 60 * 1000; // 1 saat
 
+// ─── COOKIES dosyası — env var'dan oku ───────────────────────
+// YT_COOKIES env var'ına Netscape format cookies.txt içeriği yapıştır
+const fs = require('fs');
+const path = require('path');
+const COOKIES_PATH = path.join('/tmp', 'yt-cookies.txt');
+let cookiesAvailable = false;
+try {
+  if (process.env.YT_COOKIES) {
+    fs.writeFileSync(COOKIES_PATH, process.env.YT_COOKIES, 'utf8');
+    cookiesAvailable = true;
+    console.log('[Cookies] YT_COOKIES env var bulundu, ' + process.env.YT_COOKIES.length + ' karakter, ' + COOKIES_PATH + ' yazıldı');
+  } else {
+    console.warn('[Cookies] YT_COOKIES env var YOK. YouTube bot detection riski yüksek!');
+  }
+} catch (e) {
+  console.error('[Cookies] Yazma hatası:', e.message);
+}
+
 async function getDirectStreamUrl(videoUrl) {
   const cached = videoInfoCache.get(videoUrl);
   if (cached && cached.expiresAt > Date.now()) {
@@ -54,50 +72,60 @@ async function getDirectStreamUrl(videoUrl) {
   }
 
   // YouTube 2024'ten beri 'web' client'ı bot olarak işaretliyor.
-  // tv_embedded ve android client'ları engellemeyi atlatıyor.
-  // Birden fazla client dene, biri çalışırsa onu kullan.
+  // Cookies + farklı client kombinasyonları deneniyor.
   const clientStrategies = [
-    { extractorArgs: 'youtube:player_client=tv_embedded,web_safari', format: '18' },
-    { extractorArgs: 'youtube:player_client=android', format: '18' },
-    { extractorArgs: 'youtube:player_client=ios', format: '18' },
-    { extractorArgs: 'youtube:player_client=tv_embedded', format: 'best[height<=480][ext=mp4]/best[ext=mp4]' },
-    { extractorArgs: 'youtube:player_client=mediaconnect', format: '18' },
+    // 1. Cookies + web client (en başarılı kombinasyon)
+    { extractorArgs: 'youtube:player_client=web', format: '18', useCookies: true },
+    // 2. Cookies + tv_embedded
+    { extractorArgs: 'youtube:player_client=tv_embedded', format: '18', useCookies: true },
+    // 3. Cookies + android
+    { extractorArgs: 'youtube:player_client=android', format: '18', useCookies: true },
+    // 4. Cookies'siz fallback'ler
+    { extractorArgs: 'youtube:player_client=tv_embedded,web_safari', format: '18', useCookies: false },
+    { extractorArgs: 'youtube:player_client=ios', format: '18', useCookies: false },
+    { extractorArgs: 'youtube:player_client=mediaconnect', format: 'best[height<=480][ext=mp4]/best[ext=mp4]', useCookies: false },
   ];
 
   let lastError = null;
   for (const strategy of clientStrategies) {
+    // Cookies istenen ama mevcut değilse bu stratejiyi atla
+    if (strategy.useCookies && !cookiesAvailable) continue;
+
     try {
-      console.log(`[yt-dlp] Deneniyor: ${strategy.extractorArgs}`);
-      const info = await youtubedl(videoUrl, {
+      console.log(`[yt-dlp] Deneniyor: ${strategy.extractorArgs}${strategy.useCookies ? ' (+cookies)' : ''}`);
+      const opts = {
         dumpSingleJson: true,
         format: strategy.format,
         noWarnings: true,
         noCheckCertificates: true,
         preferFreeFormats: true,
-        youtubeSkipDashManifest: true,
         extractorArgs: strategy.extractorArgs,
-        // YouTube botluk tespitini zorlaştır
-        userAgent: 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36',
-      });
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      };
+      if (strategy.useCookies && cookiesAvailable) {
+        opts.cookies = COOKIES_PATH;
+      }
+
+      const info = await youtubedl(videoUrl, opts);
 
       const url = info.url || info.requested_formats?.[0]?.url || info.formats?.find(f => f.url)?.url;
       if (!url) {
         throw new Error('Stream URL alınamadı (info objesi geldi ama url yok)');
       }
-      console.log(`[yt-dlp] ✅ ${strategy.extractorArgs} ile başarılı`);
+      console.log(`[yt-dlp] ✅ ${strategy.extractorArgs}${strategy.useCookies ? ' (+cookies)' : ''} ile başarılı`);
       videoInfoCache.set(videoUrl, { url, expiresAt: Date.now() + VIDEO_INFO_TTL_MS });
       return url;
     } catch (e) {
       lastError = e;
-      const msg = (e.message || '').substring(0, 200);
-      console.warn(`[yt-dlp] ${strategy.extractorArgs} başarısız: ${msg}`);
-      // "Sign in to confirm" tipik bot detection — diğer client'a geç
+      const msg = (e.message || '').substring(0, 300);
+      console.warn(`[yt-dlp] ${strategy.extractorArgs}${strategy.useCookies ? ' (+cookies)' : ''} başarısız: ${msg.substring(0, 150)}`);
       continue;
     }
   }
 
   // Hepsi başarısız
-  throw new Error('Tüm yt-dlp client\'ları başarısız: ' + (lastError?.message || 'unknown'));
+  const errSummary = (lastError?.message || 'unknown').substring(0, 400);
+  throw new Error('Tüm yt-dlp client\'ları başarısız. Cookies durumu: ' + (cookiesAvailable ? 'mevcut' : 'YOK (Render env var YT_COOKIES ekle)') + '. Son hata: ' + errSummary);
 }
 
 // ─── HEALTH ENDPOINT ─────────────────────────────────────────────
@@ -106,6 +134,7 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     firebase: firebaseReady,
+    cookies: cookiesAvailable,
     cacheSize: videoInfoCache.size,
     uptime: process.uptime(),
     memoryMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
